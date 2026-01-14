@@ -2554,7 +2554,7 @@ def generate_song(
     def pick_kind() -> str:
         weights: List[float] = []
         for k in SECTION_KINDS_RANDOM:
-if k == "downpicking":
+            if k == "downpicking":
                 weights.append(float(SECTION_DOWNPICK_WEIGHT))
             elif k == "melodies":
                 weights.append(float(SECTION_MELODIES_WEIGHT))
@@ -3151,7 +3151,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         choices=("random",) + CHORDPROGRESSION_CHOICES,
         help=(
-            "Force section=chordprogression. Optionally pick a named classical progression "
+            "Force section=chordsprog. Optionally pick a named classical progression "
             "template from the pool; omit the value for random."
         ),
     )
@@ -3191,10 +3191,12 @@ def main() -> None:
     vel = clampi(int(a.velocity), 1, 127)
 
     forced_section = str(a.section) if a.section else None
+    if forced_section == "chordprogression":
+        forced_section = "chordsprog"
     chordprog = None
     if a.chordprogression is not None:
         forced_section = "chordsprog"
-chordprog = None if str(a.chordprogression) == "random" else str(a.chordprogression)
+        chordprog = None if str(a.chordprogression) == "random" else str(a.chordprogression)
 
     events, bar_sections, beat_chords, label_to_ctx, bars_out = generate_song(
         total_bars=bars,
