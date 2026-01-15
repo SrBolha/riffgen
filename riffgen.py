@@ -100,11 +100,11 @@ VOCAL_DEFAULT_VELOCITY = 80
 PEDALPOINT_TONIC_WEIGHT = 0.45
 
 # Section selection: all sections equal chance, except these are rarer.
-SECTION_DOWNPICK_WEIGHT = 0.20
-SECTION_MELODIES_WEIGHT = 0.20
+SECTION_DOWNPICK_WEIGHT = 0.08
+SECTION_MELODIES_WEIGHT = 0.08
 
 # The complete "kind" pool.
-SECTION_KINDS: List[str] = [
+SECTION_KINDS_BASE: List[str] = [
     "gallops",
     "gallopsopen",
     "bursts",
@@ -119,10 +119,40 @@ SECTION_KINDS: List[str] = [
     "classical",
     "downpicking",
     "melodies",
+    "solomelody",
 ]
 
-# Random selection pool: chordprogression is superseded by chordsprog.
-SECTION_KINDS_RANDOM: Tuple[str, ...] = tuple(k for k in SECTION_KINDS if k != "chordprogression")
+PROG_KIND_MAP: Dict[str, str] = {
+    k: f"{k}prog" for k in SECTION_KINDS_BASE if k not in ("chordprogression", "chordsprog", "solomelody")
+}
+PROG_KIND_REVERSE: Dict[str, str] = {v: k for k, v in PROG_KIND_MAP.items()}
+PROG_SECTION_KINDS: Tuple[str, ...] = tuple(sorted(set(PROG_KIND_MAP.values()) - set(SECTION_KINDS_BASE)))
+
+SECTION_KINDS: List[str] = list(SECTION_KINDS_BASE) + list(PROG_SECTION_KINDS)
+
+# Random selection pool: chordprogression is superseded; prog variants are 50% of selections.
+SECTION_KINDS_RANDOM_BASE: Tuple[str, ...] = tuple(
+    k for k in SECTION_KINDS_BASE if k not in ("chordprogression", "chordsprog", "solomelody")
+)
+
+
+def _apply_prog_mode(kind: str, force_prog: Optional[bool]) -> str:
+    kind = str(kind)
+    if force_prog is True:
+        if kind in PROG_KIND_MAP:
+            return PROG_KIND_MAP[kind]
+        if kind in ("chords", "chordprogression"):
+            return "chordsprog"
+        return kind
+    if force_prog is False:
+        if kind in PROG_KIND_REVERSE:
+            return PROG_KIND_REVERSE[kind]
+        if kind == "chordsprog":
+            return "chords"
+        if kind == "chordprogression":
+            return "chords"
+        return kind
+    return kind
 
 # Chord-progression templates used by the "chordprogression" section.
 #
@@ -352,15 +382,20 @@ def _expand_chordprogression_pool(
 
 CHORDPROGRESSION_POOL = _expand_chordprogression_pool(CHORDPROGRESSION_POOL)
 CHORDPROGRESSION_CHOICES: Tuple[str, ...] = tuple(sorted(CHORDPROGRESSION_POOL.keys()))
+CHORDPROGRESSION_MOODS: Tuple[str, ...] = ("sad", "happy", "any")
 
 
 
 # Debug/UX: surfaced in riff.txt/stdout so you can confirm what each label used.
 LAST_LABEL_KINDS: Dict[str, str] = {}
+LAST_SOLO_LABEL: Optional[str] = None
+LAST_SOLO_BASE_KIND: Optional[str] = None
 
 # Vocals register (MIDI pitches)
 VOCAL_LO_MIDI = 55  # ~G3
 VOCAL_HI_MIDI = 76  # ~E5
+SOLO_LO_MIDI = OPEN[6] + 12  # >= one octave above low D
+SOLO_HI_MIDI = OPEN[6] + 48  # 3 octaves above low D
 
 
 
@@ -971,12 +1006,72 @@ def shift_events(events: List[Event], shift_beats: float) -> List[Event]:
     return [Event(start_beats=float(e.start_beats) + float(shift_beats), dur_beats=e.dur_beats, notes=list(e.notes), velocity=e.velocity) for e in events]
 
 
+def _transpose_events(events: List[Event], semitones: int) -> List[Event]:
+    if int(semitones) == 0:
+        return [Event(start_beats=e.start_beats, dur_beats=e.dur_beats, notes=list(e.notes), velocity=e.velocity) for e in events]
+    out: List[Event] = []
+    for e in events:
+        notes: List[Tuple[int, int]] = []
+        for s, f in e.notes:
+            pitch = string_fret_to_pitch(int(s), int(f)) + int(semitones)
+            notes.append(pitch_to_string_fret(int(pitch), prefer_low_strings=True))
+        out.append(Event(start_beats=e.start_beats, dur_beats=e.dur_beats, notes=notes, velocity=e.velocity))
+    return out
+
+
+def _trim_events_to_beats(events: List[Event], max_beats: float) -> List[Event]:
+    limit = float(max_beats)
+    out: List[Event] = []
+    for e in events:
+        if float(e.start_beats) >= limit:
+            continue
+        dur = min(float(e.dur_beats), limit - float(e.start_beats))
+        if dur <= 0:
+            continue
+        out.append(Event(start_beats=e.start_beats, dur_beats=dur, notes=list(e.notes), velocity=e.velocity))
+    return out
+
+
 def seed_for_label(seed: int, label: str) -> int:
     h = 2166136261
     for ch in (str(seed) + "|" + label):
         h ^= ord(ch)
         h = (h * 16777619) & 0xFFFFFFFF
     return int(h)
+
+
+def _transpose_offset_for_label(seed: int, label: str) -> int:
+    rng = random.Random(int(seed_for_label(seed, label)) ^ 0x3D5B79)
+    return int(rng.choice([-3, 3]))
+
+
+def _is_prog_kind(kind: Optional[str]) -> bool:
+    if not kind:
+        return False
+    k = str(kind)
+    return k in ("chordsprog", "chordprogression", "solomelody") or k.endswith("prog")
+
+
+def _transpose_pitch_in_range(pitch: int, semitones: int, lo: int, hi: int) -> int:
+    p = int(pitch) + int(semitones)
+    if p < int(lo):
+        while p < int(lo):
+            p += 12
+    elif p > int(hi):
+        while p > int(hi):
+            p -= 12
+    return int(clampi(p, int(lo), int(hi)))
+
+
+def _avoid_pcs_for_chord(scale_pcs: Sequence[int], chord_pcs: Sequence[int]) -> List[int]:
+    """Avoid notes are scale tones a semitone above any chord tone."""
+    scale = {int(p) % 12 for p in scale_pcs}
+    out: List[int] = []
+    for pc in chord_pcs:
+        avoid = (int(pc) + 1) % 12
+        if avoid in scale:
+            out.append(int(avoid))
+    return out
 
 
 def trim_to_bars(events: List[Event], bar_sections: List[str], bars: int) -> Tuple[List[Event], List[str]]:
@@ -1880,12 +1975,17 @@ def _select_chordprogression_template(
     rng: random.Random,
     ctx: MelodyContext,
     forced: Optional[str],
+    mood: str,
 ) -> Tuple[str, ChordProgressionTemplate]:
     if forced:
         name = str(forced)
         if name not in CHORDPROGRESSION_POOL:
             raise ValueError(f"Unknown chordprogression: {name}")
         return name, CHORDPROGRESSION_POOL[name]
+
+    mood = str(mood or "sad").strip().lower()
+    if mood not in CHORDPROGRESSION_MOODS:
+        raise ValueError(f"Unknown chord mood: {mood}")
 
     minorish = _is_minorish(ctx)
     names = list(CHORDPROGRESSION_CHOICES)
@@ -1894,16 +1994,30 @@ def _select_chordprogression_template(
         t = CHORDPROGRESSION_POOL[n]
         w = float(t.weight)
         tags = set(t.tags)
-        if minorish:
-            if "minor" in tags or "sad" in tags:
+        is_sad = ("sad" in tags) or ("minor" in tags)
+        is_happy = ("happy" in tags) or ("major" in tags and "sad" not in tags and "minor" not in tags)
+
+        if mood == "sad":
+            if is_sad:
+                w *= 2.1
+            if is_happy and "sad" not in tags:
+                w *= 0.35
+        elif mood == "happy":
+            if is_happy:
                 w *= 2.0
-            if "major" in tags and "sad" not in tags:
-                w *= 0.75
+            if is_sad:
+                w *= 0.35
         else:
-            if "major" in tags:
-                w *= 1.35
-            if "minor" in tags:
-                w *= 0.75
+            if minorish:
+                if is_sad:
+                    w *= 2.0
+                if "major" in tags and "sad" not in tags:
+                    w *= 0.75
+            else:
+                if "major" in tags:
+                    w *= 1.35
+                if "minor" in tags:
+                    w *= 0.75
         if "chromatic" in tags:
             w *= 1.05
         weights.append(max(0.01, w))
@@ -1947,6 +2061,141 @@ def _build_cycle_tokens_and_durations(
     return base, durs
 
 
+def _build_progression_tokens_and_durations(
+    tokens: Sequence[str],
+    *,
+    bars: int,
+    rng: random.Random,
+) -> Tuple[List[str], List[int]]:
+    tokens = list(tokens)
+    if len(tokens) > 8:
+        tokens = tokens[:8]
+
+    min_bars = max(4, min(int(bars), 8))
+    cycle_tokens, cycle_durs = _build_cycle_tokens_and_durations(tokens, repeats=2, min_bars=min_bars, rng=rng)
+
+    seg_tokens: List[str] = []
+    seg_durs: List[int] = []
+    total = 0
+    i = 0
+    while total < int(bars):
+        tok = str(cycle_tokens[i % len(cycle_tokens)])
+        dur = int(cycle_durs[i % len(cycle_durs)])
+        if total + dur > int(bars):
+            dur = int(bars) - int(total)
+        if dur <= 0:
+            break
+        seg_tokens.append(tok)
+        seg_durs.append(dur)
+        total += dur
+        i += 1
+
+    if int(total) < int(bars) and seg_durs:
+        seg_durs[-1] += int(bars) - int(total)
+
+    return seg_tokens, seg_durs
+
+
+def _degree_index_for_root_pc(ctx: MelodyContext, root_pc: int) -> int:
+    root_pc = int(root_pc) % 12
+    best = 0
+    best_dist = 999
+    for i, d in enumerate(ctx.degrees):
+        pc = int(d.root_pc) % 12
+        if pc == root_pc:
+            return int(i)
+        dist = min((root_pc - pc) % 12, (pc - root_pc) % 12)
+        if dist < best_dist:
+            best_dist = dist
+            best = int(i)
+    return int(best)
+
+
+def _build_chordprogression_grid(
+    *,
+    seed: int,
+    ctx: MelodyContext,
+    chordprogression: Optional[str],
+    chord_mood: str,
+    bars: int,
+) -> Tuple[List[int], List[str]]:
+    rng = random.Random(int(seed) ^ 0x7EEDBEEF)
+    _, tmpl = _select_chordprogression_template(
+        rng,
+        ctx,
+        chordprogression if chordprogression else None,
+        chord_mood,
+    )
+
+    tonic_pc = int(ctx.tonic_pc) % 12
+    tonality = _tonality_hint(ctx)
+
+    seg_tokens, seg_durs = _build_progression_tokens_and_durations(tmpl.tokens, bars=bars, rng=rng)
+
+    root_pcs: List[int] = []
+    labels: List[str] = []
+    for tok, dur_bars in zip(seg_tokens, seg_durs):
+        root_pc, _pcs, _size, label = _parse_roman_token(tok, tonic_pc=tonic_pc, tonality=tonality)
+        beats = int(dur_bars) * 4
+        root_pcs.extend([int(root_pc)] * beats)
+        labels.extend([label] * beats)
+
+    total_beats = int(bars) * 4
+    root_pcs = (root_pcs + [int(tonic_pc)] * total_beats)[:total_beats]
+    labels = (labels + [""] * total_beats)[:total_beats]
+    return root_pcs, labels
+
+
+def _generate_pedalpoint_octave_from_roots(
+    *,
+    bar_start: int,
+    vel: int,
+    seed: int,
+    root_pcs_by_beat: Sequence[int],
+    labels_by_beat: Sequence[str],
+) -> Tuple[List[Event], List[str]]:
+    rng = random.Random(int(seed) ^ 0x0C7A0B1E)
+    start_with_octave = rng.random() < 0.50
+    palm_vel = int(PALM_MUTE_VELOCITY)
+    normal_vel = int(vel)
+    lo, hi = int(PITCH_LO_MIDI), int(PITCH_HI_MIDI)
+
+    total_beats = int(len(root_pcs_by_beat))
+    events: List[Event] = []
+    chord_grid = list(labels_by_beat)
+
+    for i in range(total_beats * 2):  # 8ths
+        beat_i = int(i // 2)
+        root_pc = int(root_pcs_by_beat[beat_i]) % 12
+        pedal_pitch = int(_lowest_string6_pitch_for_pc(root_pc))
+        up = pedal_pitch + 12
+        dn = pedal_pitch - 12
+        if up <= hi:
+            octave_pitch = up
+        elif dn >= lo:
+            octave_pitch = dn
+        else:
+            octave_pitch = clampi(up, lo, hi)
+        if int(octave_pitch) == int(pedal_pitch):
+            octave_pitch = clampi((pedal_pitch + 12) if (pedal_pitch + 12 <= hi) else (pedal_pitch - 12), lo, hi)
+
+        is_octave = ((i % 2) == 0 and start_with_octave) or ((i % 2) == 1 and not start_with_octave)
+        pitch = int(octave_pitch) if is_octave else int(pedal_pitch)
+        velocity = int(normal_vel) if is_octave else int(palm_vel)
+        t = float((bar_start * 4) + (i * 0.5))
+        events.append(
+            Event(
+                start_beats=t,
+                dur_beats=0.5,
+                notes=[pitch_to_string_fret(int(pitch), True)],
+                velocity=int(velocity),
+            )
+        )
+
+    events.sort(key=lambda e: e.start_beats)
+    return events, chord_grid
+
+
 def generate_chordprogression_segment_16(
     *,
     bar_start: int,
@@ -1955,6 +2204,7 @@ def generate_chordprogression_segment_16(
     seed: int,
     ctx: MelodyContext,
     chordprogression: Optional[str],
+    chord_mood: str,
 ) -> Tuple[List[Event], List[str]]:
     """A 16-bar tonal progression segment, with strict triads/tetrads only.
 
@@ -1962,7 +2212,12 @@ def generate_chordprogression_segment_16(
     It builds a full 16-bar harmonic plan so longer progressions (>=5 chords) can repeat cleanly.
     """
     rng = random.Random(int(seed) ^ 0xC0BD1234)
-    name, tmpl = _select_chordprogression_template(rng, ctx, chordprogression if chordprogression else None)
+    name, tmpl = _select_chordprogression_template(
+        rng,
+        ctx,
+        chordprogression if chordprogression else None,
+        chord_mood,
+    )
 
     tonic_pc = int(ctx.tonic_pc) % 12
     tonality = _tonality_hint(ctx)
@@ -2119,16 +2374,22 @@ def generate_chordsprog_segment_16(
     seed: int,
     ctx: MelodyContext,
     chordprogression: Optional[str],
+    chord_mood: str,
 ) -> Tuple[List[Event], List[str]]:
-    """A 16-bar tonal progression segment rendered as powerchords/dyads.
+    """A 16-bar tonal progression segment rendered as dyads/triads.
 
     No prep runs / mini-progressions: one chord per planned duration.
-    - Major/minor triads -> powerchord (root+5), sometimes inverted (5th in bass).
+    - Powerchords (root+5), sometimes inverted.
     - Dim/aug 5th triads -> dyad (root + dim5/aug5).
-    - Tetrads -> full tetrads (4 notes).
+    - 7ths/9ths -> triads like root+5+7 or root+5+9.
     """
     rng = random.Random(int(seed) ^ 0xB16B00B5)
-    _, tmpl = _select_chordprogression_template(rng, ctx, chordprogression if chordprogression else None)
+    _, tmpl = _select_chordprogression_template(
+        rng,
+        ctx,
+        chordprogression if chordprogression else None,
+        chord_mood,
+    )
 
     tonic_pc = int(base_tonic_midi) % 12
     tonality = _tonality_hint(ctx)
@@ -2190,31 +2451,64 @@ def generate_chordsprog_segment_16(
         top = up if up <= hi else (dn if dn >= lo else up)
         return choose_dyad_fingering(bass, top)
 
+    def split_chord_durations(total_beats: int) -> List[int]:
+        out: List[int] = []
+        remain = int(total_beats)
+        while remain > 0:
+            choices: List[int] = []
+            weights: List[float] = []
+            for dur, w in ((4, 0.72), (2, 0.20), (1, 0.08)):
+                if dur <= remain:
+                    choices.append(dur)
+                    weights.append(w)
+            pick = int(rng.choices(choices, weights=weights, k=1)[0])
+            out.append(pick)
+            remain -= pick
+        return out
+
+    def triad_or_dyad_voicing(root_pc: int, chord_pcs: List[int]) -> List[Tuple[int, int]]:
+        intervals = {(int(pc) - int(root_pc)) % 12 for pc in chord_pcs}
+        has_dim5 = 6 in intervals and 7 not in intervals
+        has_aug5 = 8 in intervals and 7 not in intervals
+        has_7 = 10 in intervals or 11 in intervals
+        has_9 = 2 in intervals
+
+        if has_dim5 or has_aug5:
+            interval = 6 if has_dim5 else 8
+            return dyad_notes_for_interval(root_pc, interval, False)
+
+        if has_7:
+            seventh = 11 if 11 in intervals else 10
+            triad_pcs = [root_pc, (root_pc + 7) % 12, (root_pc + seventh) % 12]
+            return choose_poly_fingering_strict(triad_pcs, prefer_root_bass=True)
+
+        if has_9 or rng.random() < 0.18:
+            triad_pcs = [root_pc, (root_pc + 7) % 12, (root_pc + 2) % 12]
+            return choose_poly_fingering_strict(triad_pcs, prefer_root_bass=True)
+
+        invert = bool(rng.random() < 0.35)
+        return dyad_notes_for_interval(root_pc, 7, invert)
+
     events: List[Event] = []
     chord_grid: List[str] = []
 
-    bar_i = 0
+    beat_i = 0
     for tok, dur_bars in zip(seg_tokens, seg_durs):
         root_pc, chord_pcs, chord_size, label = _parse_roman_token(tok, tonic_pc=tonic_pc, tonality=tonality)
         chord_pcs = chord_pcs[: chord_size]
+        voicing = triad_or_dyad_voicing(root_pc, chord_pcs)
 
-        if chord_size >= 4:
-            voicing = choose_poly_fingering_strict(chord_pcs[:4], prefer_root_bass=True)
-        else:
-            interval = fifth_interval_for_triad(root_pc, chord_pcs)
-            invert = bool(interval == 7 and rng.random() < 0.35)
-            voicing = dyad_notes_for_interval(root_pc, interval, invert)
-
-        events.append(
-            Event(
-                start_beats=float((bar_start + bar_i) * 4),
-                dur_beats=float(int(dur_bars) * 4),
-                notes=voicing,
-                velocity=int(vel),
+        for dur_beats in split_chord_durations(int(dur_bars) * 4):
+            events.append(
+                Event(
+                    start_beats=float((bar_start * 4) + beat_i),
+                    dur_beats=float(int(dur_beats)),
+                    notes=voicing,
+                    velocity=int(vel),
+                )
             )
-        )
-        chord_grid.extend([f"{label}:{pc_to_note(root_pc, True)}"] * (int(dur_bars) * 4))
-        bar_i += int(dur_bars)
+            chord_grid.extend([f"{label}:{pc_to_note(root_pc, True)}"] * int(dur_beats))
+            beat_i += int(dur_beats)
 
     chord_grid = chord_grid[: int(SEGMENT_BARS) * 4]
     return events, chord_grid
@@ -2336,9 +2630,17 @@ def phrase_motif_8(
     vel: int,
     seed: int,
     chordprogression: Optional[str] = None,
+    chord_mood: str,
     ctx: MelodyContext,
 ) -> Tuple[List[Event], List[str]]:
     rng = random.Random(int(seed) ^ 0xAA55AA55)
+    kind = str(kind)
+    if kind == "solomelody":
+        base_kind = "melodies"
+        use_prog = True
+    else:
+        base_kind = PROG_KIND_REVERSE.get(kind)
+        use_prog = base_kind is not None
 
     if kind == "classical":
         return generate_classical_phrase_8(bar_start=bar_start, vel=vel, seed=seed)
@@ -2351,6 +2653,7 @@ def phrase_motif_8(
             seed=seed,
             ctx=ctx,
             chordprogression=chordprogression,
+            chord_mood=chord_mood,
         )
 
     if kind == "chordsprog":
@@ -2361,14 +2664,59 @@ def phrase_motif_8(
             seed=seed,
             ctx=ctx,
             chordprogression=chordprogression,
+            chord_mood=chord_mood,
         )
+
+    if use_prog and base_kind in ("pedalpoint", "pedalpointoctave", "classical"):
+        prog_root_pcs, prog_labels = _build_chordprogression_grid(
+            seed=int(seed) ^ 0x22B4F11D,
+            ctx=ctx,
+            chordprogression=chordprogression,
+            chord_mood=chord_mood,
+            bars=PHRASE_BARS,
+        )
+        if base_kind == "classical":
+            events, _ = generate_classical_phrase_8(bar_start=bar_start, vel=vel, seed=seed)
+            return events, list(prog_labels)
+        if base_kind == "pedalpoint":
+            events, _ = generate_pedalpoint_phrase_8(
+                bar_start=bar_start,
+                base_tonic_midi=base_tonic_midi,
+                vel=vel,
+                seed=seed,
+                ctx=ctx,
+            )
+            return events, list(prog_labels)
+        if base_kind == "pedalpointoctave":
+            events, chord_grid = _generate_pedalpoint_octave_from_roots(
+                bar_start=bar_start,
+                vel=vel,
+                seed=seed,
+                root_pcs_by_beat=prog_root_pcs,
+                labels_by_beat=prog_labels,
+            )
+            return events, chord_grid
 
     # per bar degree plans
     plans = [choose_degree_progression(rng, ctx, length=4) for _ in range(8)]
+    prog_labels_by_bar: Optional[List[List[str]]] = None
+    if use_prog:
+        prog_root_pcs, prog_labels = _build_chordprogression_grid(
+            seed=int(seed) ^ 0x22B4F11D,
+            ctx=ctx,
+            chordprogression=chordprogression,
+            chord_mood=chord_mood,
+            bars=PHRASE_BARS,
+        )
+        for b in range(PHRASE_BARS):
+            bar_roots = prog_root_pcs[b * 4 : (b + 1) * 4]
+            plans[b] = [_degree_index_for_root_pc(ctx, pc) for pc in bar_roots]
+        prog_labels_by_bar = [prog_labels[b * 4 : (b + 1) * 4] for b in range(PHRASE_BARS)]
 
     def gen_bar(i: int, resolve: bool) -> Tuple[List[Event], List[str]]:
         b = bar_start + i
-        if kind == "melodies":
+        bar_kind = base_kind if use_prog else kind
+        if bar_kind == "melodies":
             return generate_melodies_bar(
                 bar_index=b,
                 base_tonic_midi=base_tonic_midi,
@@ -2378,9 +2726,8 @@ def phrase_motif_8(
                 degree_plan=plans[i],
                 resolve=resolve,
             )
-        if kind == "chords":
-            plan = evil_progression_plan(rng, ctx)
-            deg = plan[i]
+        if bar_kind == "chords":
+            deg = plans[i][0] if use_prog else evil_progression_plan(rng, ctx)[i]
             return generate_chords_bar(
                 bar_index=b,
                 base_tonic_midi=base_tonic_midi,
@@ -2390,7 +2737,7 @@ def phrase_motif_8(
                 bar_degree=deg,
                 resolve=resolve or (i in (3, 7)),
             )
-        if kind == "downpicking":
+        if bar_kind == "downpicking":
             return generate_downpicking_bar(
                 bar_index=b,
                 base_tonic_midi=base_tonic_midi,
@@ -2400,7 +2747,7 @@ def phrase_motif_8(
                 degree_plan=plans[i],
                 resolve=resolve,
             )
-        if kind == "gallops":
+        if bar_kind == "gallops":
             return generate_rhythm_bar(
                 section="gallops",
                 bar_index=b,
@@ -2412,7 +2759,7 @@ def phrase_motif_8(
                 power_bias=0.34,
                 resolve=resolve,
             )
-        if kind == "gallopsopen":
+        if bar_kind == "gallopsopen":
             return generate_rhythm_bar(
                 section="gallopsopen",
                 bar_index=b,
@@ -2424,7 +2771,7 @@ def phrase_motif_8(
                 power_bias=0.34,
                 resolve=resolve,
             )
-        if kind == "bursts":
+        if bar_kind == "bursts":
             return generate_rhythm_bar(
                 section="bursts",
                 bar_index=b,
@@ -2436,7 +2783,7 @@ def phrase_motif_8(
                 power_bias=0.34,
                 resolve=resolve,
             )
-        if kind == "justbursts":
+        if bar_kind == "justbursts":
             evs, ch = generate_rhythm_bar(
                 section="bursts",
                 bar_index=b,
@@ -2452,7 +2799,7 @@ def phrase_motif_8(
                 evs = _apply_dim_interval_to_events(evs)
             return evs, ch
 
-        if kind == "burstsopen":
+        if bar_kind == "burstsopen":
             return generate_rhythm_bar(
                 section="burstsopen",
                 bar_index=b,
@@ -2464,7 +2811,7 @@ def phrase_motif_8(
                 power_bias=0.34,
                 resolve=resolve,
             )
-        if kind == "offbeatgallops":
+        if bar_kind == "offbeatgallops":
             return generate_rhythm_bar(
                 section="offbeatgallops",
                 bar_index=b,
@@ -2497,7 +2844,10 @@ def phrase_motif_8(
 
     for i, (evs, ch) in {0: (ev1, ch1), 1: (ev2, ch2), 3: (ev4, ch4), 7: (ev8, ch8)}.items():
         full.extend(evs)
-        chords_by_bar[i] = ch
+        if prog_labels_by_bar is not None:
+            chords_by_bar[i] = list(prog_labels_by_bar[i])
+        else:
+            chords_by_bar[i] = ch
 
     # bar3 copy bar1, bar5 copy bar1, bar6 copy bar2, bar7 copy bar1
     for src, dst in [(0, 2), (0, 4), (1, 5), (0, 6)]:
@@ -2521,6 +2871,8 @@ def generate_song(
     ctx: MelodyContext,
     tonechange: int,
     chordprogression: Optional[str] = None,
+    chord_mood: str,
+    force_prog: Optional[bool],
     section: Optional[str] = None,
 ) -> Tuple[List[Event], List[str], List[str], Dict[str, MelodyContext], int]:
     """Generate the guitar song plus a beat-level chord guide.
@@ -2553,20 +2905,51 @@ def generate_song(
 
     def pick_kind() -> str:
         weights: List[float] = []
-        for k in SECTION_KINDS_RANDOM:
-if k == "downpicking":
+        for k in SECTION_KINDS_RANDOM_BASE:
+            if k == "downpicking":
                 weights.append(float(SECTION_DOWNPICK_WEIGHT))
             elif k == "melodies":
                 weights.append(float(SECTION_MELODIES_WEIGHT))
             else:
                 weights.append(1.0)
-        return str(rng.choices(SECTION_KINDS_RANDOM, weights=weights, k=1)[0])
+        pick = str(rng.choices(SECTION_KINDS_RANDOM_BASE, weights=weights, k=1)[0])
+        if force_prog is None:
+            if pick in PROG_KIND_MAP and rng.random() < 0.50:
+                pick = PROG_KIND_MAP[pick]
+            return pick
+        return _apply_prog_mode(pick, force_prog)
 
     for lbl in sorted(set(labels)):
-        label_kind[lbl] = str(section) if section else pick_kind()
+        chosen = str(section) if section else pick_kind()
+        label_kind[lbl] = _apply_prog_mode(chosen, force_prog)
+
+    solo_label: Optional[str] = None
+    solo_base_kind: Optional[str] = None
+    if any(_is_prog_kind(k) for k in label_kind.values()):
+        prog_labels = [lbl for lbl, k in label_kind.items() if _is_prog_kind(k)]
+        if prog_labels:
+            cand = sorted(set(prog_labels))
+            weights: List[float] = []
+            for lbl in cand:
+                kind = str(label_kind.get(lbl, ""))
+                base = PROG_KIND_REVERSE.get(kind, kind)
+                if kind == "chordsprog":
+                    weights.append(6.0)
+                elif base == "chords":
+                    weights.append(3.0)
+                elif base in ("downpicking", "melodies"):
+                    weights.append(0.01)
+                else:
+                    weights.append(1.0)
+            solo_label = str(rng.choices(cand, weights=weights, k=1)[0])
+            solo_base_kind = str(label_kind.get(solo_label, ""))
 
     global LAST_LABEL_KINDS
     LAST_LABEL_KINDS = dict(label_kind)
+    global LAST_SOLO_LABEL
+    LAST_SOLO_LABEL = solo_label
+    global LAST_SOLO_BASE_KIND
+    LAST_SOLO_BASE_KIND = solo_base_kind
 
     candidates = sorted(set(labels))
     tc = clampi(int(tonechange), 0, 9999)
@@ -2602,6 +2985,7 @@ if k == "downpicking":
             vel=vel,
             seed=phrase_seed,
             chordprogression=chordprogression,
+            chord_mood=chord_mood,
             ctx=use_ctx,
         )
         phrase_cache[lbl] = PhraseData(kind=kind, events=evs, chords=chords, ctx=use_ctx, tonic_midi=use_tonic)
@@ -2614,24 +2998,42 @@ if k == "downpicking":
     bar = 0
     for lbl in labels:
         ph = phrase_cache[lbl]
+        transpose = _transpose_offset_for_label(seed, lbl)
+        is_bridge = (lbl == "bridge")
 
         if ph.kind in ("chordprogression", "chordsprog"):
-            # This section owns the whole 16-bar segment (no forced 8-bar repeat).
-            events.extend(shift_events(ph.events, float(bar * 4)))
-            bar_sections.extend([lbl] * SEGMENT_BARS)
-            beat_chords.extend(list(ph.chords)[: SEGMENT_BARS * 4])
-            bar += SEGMENT_BARS
+            base_events = _trim_events_to_beats(ph.events, float(PHRASE_BARS * 4))
+            base_chords = list(ph.chords)[: PHRASE_BARS * 4]
+
+            events.extend(shift_events(base_events, float(bar * 4)))
+            bar_sections.extend([lbl] * PHRASE_BARS)
+            beat_chords.extend(base_chords)
+
+            if not is_bridge:
+                transposed = _transpose_events(base_events, transpose)
+                events.extend(shift_events(transposed, float((bar + PHRASE_BARS) * 4)))
+                bar_sections.extend([lbl] * PHRASE_BARS)
+                beat_chords.extend(base_chords)
+                bar += SEGMENT_BARS
+            else:
+                bar += PHRASE_BARS
             continue
 
-        events.extend(shift_events(ph.events, float(bar * 4)))
-        bar_sections.extend([lbl] * PHRASE_BARS)
-        beat_chords.extend(list(ph.chords)[: PHRASE_BARS * 4])
+        base_events = ph.events
+        base_chords = list(ph.chords)[: PHRASE_BARS * 4]
 
-        events.extend(shift_events(ph.events, float((bar + PHRASE_BARS) * 4)))
+        events.extend(shift_events(base_events, float(bar * 4)))
         bar_sections.extend([lbl] * PHRASE_BARS)
-        beat_chords.extend(list(ph.chords)[: PHRASE_BARS * 4])
+        beat_chords.extend(base_chords)
 
-        bar += SEGMENT_BARS
+        if not is_bridge:
+            transposed = _transpose_events(base_events, transpose)
+            events.extend(shift_events(transposed, float((bar + PHRASE_BARS) * 4)))
+            bar_sections.extend([lbl] * PHRASE_BARS)
+            beat_chords.extend(base_chords)
+            bar += SEGMENT_BARS
+        else:
+            bar += PHRASE_BARS
 
     events.sort(key=lambda e: e.start_beats)
     events, bar_sections = trim_to_bars(events, bar_sections, total_bars)
@@ -2699,6 +3101,40 @@ def build_vocals_rhythm_slots(rng: random.Random, style: str) -> List[Tuple[floa
         dur = round(dur * 2.0) / 2.0
         slots.append((t, dur))
         t = round((t + dur) * 2.0) / 2.0
+    return slots
+
+
+def build_solo_rhythm_slots(rng: random.Random) -> List[Tuple[float, float]]:
+    """Return (start, dur) slots for a 4-beat bar. Grid = 0.5 beats."""
+    slots: List[Tuple[float, float]] = []
+    beat_splits: List[bool] = []
+    for beat in range(4):
+        split = rng.random() < 0.90
+        beat_splits.append(bool(split))
+        if split:
+            slots.append((float(beat), 0.5))
+            slots.append((float(beat) + 0.5, 0.5))
+        else:
+            slots.append((float(beat), 1.0))
+
+    if rng.random() < 0.45:
+        chain_len = int(rng.choice([2, 3]))
+        starts: List[int] = []
+        for start in range(0, 5 - chain_len):
+            beat_set = list(range(start, start + chain_len))
+            if all(not beat_splits[b] for b in beat_set):
+                starts.append(int(start))
+        if starts:
+            start = int(rng.choice(starts))
+            beat_set = set(range(start, start + chain_len))
+            slots = [s for s in slots if int(float(s[0])) not in beat_set]
+            for b in range(start, start + chain_len):
+                t0 = float(b)
+                slots.append((t0, 1.0 / 3.0))
+                slots.append((t0 + (1.0 / 3.0), 1.0 / 3.0))
+                slots.append((t0 + (2.0 / 3.0), 1.0 / 3.0))
+
+    slots.sort(key=lambda x: x[0])
     return slots
 
 
@@ -2789,6 +3225,199 @@ def _generate_vocal_phrase_8(
     return out
 
 
+def _generate_solo_phrase_8(
+    *,
+    beat_chords_phrase: List[str],  # 8 bars * 4 beats = 32
+    ctx: MelodyContext,
+    seed: int,
+    velocity: int,
+    lo: int,
+    hi: int,
+) -> List[VocalEvent]:
+    beat_chords_phrase = _pad_chords(list(beat_chords_phrase), 32)
+    velocity = clampi(int(velocity), 1, 127)
+
+    out: List[VocalEvent] = []
+    last_pitch: Optional[int] = None
+    last_two: List[int] = []
+    run_dir = 0
+    run_remaining = 0
+    run_step = 1
+    seq_dir = 1
+    seq_root_idx: Optional[int] = None
+    seq_pos = 0
+    seq_remaining = 0
+    seq_pattern: List[int] = []
+    pedal_pc: Optional[int] = None
+
+    for bar_in_phrase in range(8):
+        rng = random.Random(seed_for_label(seed, f"solo_phrase|{bar_in_phrase}") ^ 0x5150FACE)
+        slots = build_solo_rhythm_slots(rng)
+
+        for s, d in slots:
+            beat_idx = min(3, max(0, int(math.floor(float(s) + 1e-9))))
+            chord_label = beat_chords_phrase[bar_in_phrase * 4 + beat_idx]
+            root_pc = _parse_root_pc_from_chord_label(chord_label)
+            if root_pc is None:
+                root_pc = int(ctx.tonic_pc) % 12
+
+            scale = [int(p) % 12 for p in ctx.scale_pcs]
+            if root_pc in scale:
+                root_deg = scale.index(int(root_pc))
+            else:
+                root_deg = min(range(len(scale)), key=lambda i: abs(int(scale[i]) - int(root_pc)))
+
+            tok = str(chord_label).split(":")[0]
+            if "°" in tok or "dim" in tok:
+                third = 3
+                fifth = 6
+            elif "aug" in tok or "+" in tok:
+                third = 4
+                fifth = 8
+            elif tok.islower():
+                third = 3
+                fifth = 7
+            else:
+                third = 4
+                fifth = 7
+            chord_pcs = {root_pc, (root_pc + third) % 12, (root_pc + fifth) % 12}
+            if "maj7" in tok:
+                chord_pcs.add((root_pc + 11) % 12)
+            elif "7" in tok or "dim7" in tok:
+                chord_pcs.add((root_pc + 10) % 12)
+
+            strong = (abs(float(s) - round(float(s))) < 1e-6) and (int(beat_idx) in (0, 2))
+
+            avoid_pcs = set(_avoid_pcs_for_chord(scale, chord_pcs))
+            allow_avoid = bool(float(d) < 0.5 + 1e-9)  # only tuplets may hit avoid notes
+            usable_scale = list(scale) if allow_avoid else ([pc for pc in scale if int(pc) not in avoid_pcs] or list(scale))
+            last_pc = int(last_pitch) % 12 if last_pitch is not None else None
+            target_pc: Optional[int] = None
+            mode_weights = None
+            if float(d) < 0.5 + 1e-9:
+                mode_weights = {"run": 0.50, "seq": 0.40, "arp": 0.03, "pedal": 0.07}
+            elif float(d) <= 0.5 + 1e-9:
+                mode_weights = {"run": 0.48, "seq": 0.38, "arp": 0.04, "pedal": 0.10}
+            else:
+                mode_weights = {"chord": 0.50, "run": 0.30, "arp": 0.03, "pedal": 0.17}
+
+            mode = str(rng.choices(list(mode_weights.keys()), weights=list(mode_weights.values()), k=1)[0])
+
+            if mode == "chord":
+                target_pc = int(rng.choice(sorted(chord_pcs)))
+            elif mode == "arp":
+                if last_pc is not None and last_pc in usable_scale:
+                    idx = usable_scale.index(last_pc)
+                else:
+                    idx = min(range(len(usable_scale)), key=lambda i: abs(int(usable_scale[i]) - int(root_pc)))
+                step = int(rng.choice([2, 2, 1]))
+                cand = int(usable_scale[(idx + step) % len(usable_scale)]) % 12
+                target_pc = cand if cand in usable_scale else int(rng.choice(sorted(chord_pcs)))
+            elif mode == "pedal":
+                if pedal_pc is None:
+                    pedal_pc = int(rng.choice(sorted(chord_pcs)))
+                if rng.random() < 0.55:
+                    target_pc = int(pedal_pc)
+                else:
+                    if last_pc is not None and last_pc in usable_scale:
+                        idx = usable_scale.index(last_pc)
+                        step = int(rng.choice([-2, -1, 1, 2]))
+                        target_pc = int(usable_scale[(idx + step) % len(usable_scale)]) % 12
+            elif mode == "seq":
+                if seq_remaining <= 0 or seq_root_idx is None:
+                    if root_pc in usable_scale:
+                        seq_root_idx = usable_scale.index(int(root_pc))
+                    elif last_pc is not None and last_pc in usable_scale:
+                        seq_root_idx = usable_scale.index(int(last_pc))
+                    else:
+                        seq_root_idx = min(range(len(usable_scale)), key=lambda i: abs(int(usable_scale[i]) - int(root_pc)))
+                    seq_dir = int(rng.choice([-1, 1]))
+                    seq_remaining = int(rng.choice([6, 9]) if allow_avoid else rng.choice([4, 6]))
+                    seq_pattern = list(
+                        rng.choice(
+                            [
+                                [0, 1, 2],        # 1-2-3
+                                [0, 2, 1],        # 1-3-2
+                                [0, 1, 2, 0],     # 1-2-3-1
+                                [0, 2, 1, 3],     # 1-3-2-4
+                                [0, 2],           # diatonic 3rds: 1-3, 2-4, ...
+                                [0, 1, 2, 1],     # 1-2-3-2
+                                [0, 1, 2, 3],     # 1-2-3-4
+                                [0, 2, 3, 1],     # sawtooth 3rds: 1-3-4-2
+                                [0, 1, 2, 3, 2],  # 1-2-3-4-3
+                                [0, 1, 2, 3, 4],  # 1-2-3-4-5
+                                [0, 1, 2, 3, 4, 3, 2],  # 1-2-3-4-5-4-3
+                                [0, -1, 0, 1, 2, 3],    # 1-7-1-2-3-4
+                                [0, 3],           # diatonic 4ths
+                                [0, 4],           # diatonic 5ths
+                            ]
+                        )
+                    )
+                    seq_pos = 0
+                if seq_root_idx is not None:
+                    pat_len = max(1, len(seq_pattern))
+                    offset = int(seq_pattern[seq_pos % pat_len])
+                    cand = int(usable_scale[(seq_root_idx + (seq_dir * offset)) % len(usable_scale)]) % 12
+                    target_pc = cand
+                    seq_pos += 1
+                    if seq_pos >= len(seq_pattern):
+                        seq_pos = 0
+                        seq_root_idx = int(seq_root_idx + seq_dir)
+                seq_remaining = max(0, int(seq_remaining - 1))
+            else:  # run
+                run_bias = 0.85 if allow_avoid else 0.60
+                if last_pc is not None and last_pc in usable_scale:
+                    if run_remaining <= 0 and rng.random() < run_bias:
+                        run_dir = int(rng.choice([-1, 1]))
+                        run_step = int(rng.choice([1, 1, 2]))
+                        run_remaining = int(rng.choice([4, 5, 6]) if allow_avoid else rng.choice([3, 4]))
+                    if run_remaining > 0:
+                        idx = usable_scale.index(last_pc)
+                        cand = int(usable_scale[(idx + (run_dir * run_step)) % len(usable_scale)]) % 12
+                        target_pc = cand
+                        run_remaining -= 1
+            if target_pc is None:
+                if strong and rng.random() < 0.60:
+                    target_pc = int(rng.choice(sorted(chord_pcs)))
+                else:
+                    pool = list(chord_pcs) + usable_scale
+                    weights = [2.5 if pc in chord_pcs else 1.0 for pc in pool]
+                    target_pc = int(rng.choices(pool, weights=weights, k=1)[0])
+            if not allow_avoid and int(target_pc) in avoid_pcs:
+                non_avoid = [pc for pc in usable_scale if int(pc) not in avoid_pcs] or list(usable_scale)
+                if non_avoid:
+                    target_pc = int(rng.choice(non_avoid))
+
+            pitch = choose_pitch_for_pc_in_range(rng, target_pc, last_pitch, lo, hi)
+            if last_pitch is not None and pitch == last_pitch:
+                alt_pcs = [pc for pc in scale if int(pc) != int(target_pc)]
+                if alt_pcs:
+                    alt_pc = int(rng.choice(alt_pcs))
+                    pitch = choose_pitch_for_pc_in_range(rng, alt_pc, int(last_pitch) - 12, lo, hi)
+            if last_pitch is not None and pitch == last_pitch:
+                pitch = choose_pitch_for_pc_in_range(rng, target_pc, int(last_pitch) - 12, lo, hi)
+            if last_pitch is not None and len(last_two) == 2:
+                if int(pitch) == int(last_two[0]) and int(last_pitch) == int(last_two[1]):
+                    alt_pcs = [pc for pc in scale if int(pc) not in (int(target_pc), int(last_pitch) % 12)]
+                    if alt_pcs:
+                        alt_pc = int(rng.choice(alt_pcs))
+                        pitch = choose_pitch_for_pc_in_range(rng, alt_pc, int(last_pitch) - 12, lo, hi)
+
+            last_pitch = int(pitch)
+            last_two = (last_two + [int(pitch)])[-2:]
+            out.append(
+                VocalEvent(
+                    start_beats=float(bar_in_phrase * 4) + float(s),
+                    dur_beats=float(d),
+                    pitch=int(pitch),
+                    velocity=int(velocity),
+                )
+            )
+
+    out.sort(key=lambda e: e.start_beats)
+    return out
+
+
 def _choose_vocal_range_for_song(seed: int) -> Tuple[int, int]:
     """Pick a 1-octave (12 semitone) range for the whole vocal track; biased toward low notes."""
     rng = random.Random(seed_for_label(seed, "vocal_range|song") ^ 0xFACEB00C)
@@ -2796,6 +3425,21 @@ def _choose_vocal_range_for_song(seed: int) -> Tuple[int, int]:
     span = 12
     lo_min = int(VOCAL_LO_MIDI)
     lo_max = int(VOCAL_HI_MIDI) - span
+    lo_max = max(lo_min, lo_max)
+
+    candidates = list(range(lo_min, lo_max + 1))
+    weights = [1.0 / (1.0 + (p - lo_min)) for p in candidates]
+    lo = int(rng.choices(candidates, weights=weights, k=1)[0])
+    return lo, int(lo + span)
+
+
+def _choose_solo_range_for_song(seed: int) -> Tuple[int, int]:
+    """Pick a 1-octave (12 semitone) range for the solo track; biased toward low notes."""
+    rng = random.Random(seed_for_label(seed, "solo_range|song") ^ 0xB16B00B5)
+
+    span = 12
+    lo_min = int(SOLO_LO_MIDI)
+    lo_max = int(SOLO_HI_MIDI) - span
     lo_max = max(lo_min, lo_max)
 
     candidates = list(range(lo_min, lo_max + 1))
@@ -2887,6 +3531,17 @@ def generate_vocals_for_song(
     velocity = clampi(int(velocity), 1, 127)
     lo, hi = _choose_vocal_range_for_song(seed)
 
+    prog_labels = [lbl for lbl in ("chorus", "verse", "bridge") if _is_prog_kind(LAST_LABEL_KINDS.get(lbl))]
+    source_phrase_chords: Optional[List[str]] = None
+    if prog_labels:
+        source_label = "chorus" if "chorus" in prog_labels else prog_labels[0]
+        for i, lbl in enumerate(bar_sections):
+            if lbl != source_label:
+                continue
+            start = int(i) * 4
+            source_phrase_chords = beat_chords[start : start + (PHRASE_BARS * 4)]
+            break
+
     phrase_cache: Dict[str, List[VocalEvent]] = {}
     out: List[VocalEvent] = []
 
@@ -2910,7 +3565,10 @@ def generate_vocals_for_song(
             continue
 
         if lbl not in phrase_cache:
-            phrase_chords = beat_chords[bar_i * 4 : (bar_i + 8) * 4]
+            if source_phrase_chords is not None:
+                phrase_chords = list(source_phrase_chords)
+            else:
+                phrase_chords = beat_chords[bar_i * 4 : (bar_i + 8) * 4]
             phrase_cache[lbl] = _generate_vocal_phrase_8(
                 lbl=lbl,
                 beat_chords_phrase=phrase_chords,
@@ -2931,12 +3589,82 @@ def generate_vocals_for_song(
             if t < seg_end_beats - 1e-9:
                 out.append(VocalEvent(start_beats=t, dur_beats=ev.dur_beats, pitch=ev.pitch, velocity=ev.velocity))
 
-        if run >= 16:
+        if run >= 16 and lbl != "bridge":
             rep_shift = float(8 * 4)
+            transpose = _transpose_offset_for_label(seed, lbl)
             for ev in phrase:
                 t = seg_start_beats + rep_shift + float(ev.start_beats)
                 if t < seg_end_beats - 1e-9:
-                    out.append(VocalEvent(start_beats=t, dur_beats=ev.dur_beats, pitch=ev.pitch, velocity=ev.velocity))
+                    pitch = _transpose_pitch_in_range(ev.pitch, transpose, lo, hi)
+                    out.append(VocalEvent(start_beats=t, dur_beats=ev.dur_beats, pitch=int(pitch), velocity=ev.velocity))
+
+        bar_i += run
+
+    out.sort(key=lambda e: e.start_beats)
+    return out
+
+
+def generate_solo_for_song(
+    *,
+    bar_sections: List[str],
+    beat_chords: List[str],
+    label_to_ctx: Dict[str, MelodyContext],
+    seed: int,
+    velocity: int = VOCAL_DEFAULT_VELOCITY,
+) -> List[VocalEvent]:
+    """Generate a single solo melody for one prog section (max one per song)."""
+    if not LAST_SOLO_LABEL:
+        return []
+
+    velocity = clampi(int(velocity), 1, 127)
+    lo, hi = _choose_solo_range_for_song(seed)
+
+    phrase_cache: Dict[str, List[VocalEvent]] = {}
+    out: List[VocalEvent] = []
+
+    bar_i = 0
+    bars_total = len(bar_sections)
+    while bar_i < bars_total:
+        lbl = bar_sections[bar_i]
+        run = 1
+        while (bar_i + run) < bars_total and bar_sections[bar_i + run] == lbl:
+            run += 1
+
+        if lbl != LAST_SOLO_LABEL:
+            bar_i += run
+            continue
+
+        ctx = label_to_ctx.get(lbl)
+        if ctx is None:
+            return []
+
+        if lbl not in phrase_cache:
+            phrase_chords = beat_chords[bar_i * 4 : (bar_i + PHRASE_BARS) * 4]
+            phrase_cache[lbl] = _generate_solo_phrase_8(
+                beat_chords_phrase=phrase_chords,
+                ctx=ctx,
+                seed=seed_for_label(seed, f"solo|{lbl}"),
+                velocity=velocity,
+                lo=lo,
+                hi=hi,
+            )
+        phrase = phrase_cache[lbl]
+
+        seg_start_beats = float(bar_i * 4)
+        seg_end_beats = float((bar_i + run) * 4)
+        for ev in phrase:
+            t = seg_start_beats + float(ev.start_beats)
+            if t < seg_end_beats - 1e-9:
+                out.append(VocalEvent(start_beats=t, dur_beats=ev.dur_beats, pitch=ev.pitch, velocity=ev.velocity))
+
+        if run >= 16 and lbl != "bridge":
+            rep_shift = float(8 * 4)
+            transpose = _transpose_offset_for_label(seed, lbl)
+            for ev in phrase:
+                t = seg_start_beats + rep_shift + float(ev.start_beats)
+                if t < seg_end_beats - 1e-9:
+                    pitch = _transpose_pitch_in_range(ev.pitch, transpose, lo, hi)
+                    out.append(VocalEvent(start_beats=t, dur_beats=ev.dur_beats, pitch=int(pitch), velocity=ev.velocity))
 
         bar_i += run
 
@@ -3120,6 +3848,37 @@ def write_vocals_midi(*, bpm: int, events: List[VocalEvent], out_mid: str) -> No
     pm.write(out_mid)
 
 
+def write_solo_midi(*, bpm: int, events: List[VocalEvent], out_mid: str) -> None:
+    """Write the solo melody MIDI. Uses pretty_midi if available; otherwise a tiny fallback writer."""
+    if pretty_midi is None:
+        ppq = 480
+        notes: List[Tuple[int, int, int, int]] = []
+        for ev in events:
+            st = int(round(float(ev.start_beats) * ppq))
+            en = int(round(float(ev.start_beats + ev.dur_beats) * ppq))
+            notes.append((int(ev.pitch), st, en, int(ev.velocity)))
+        _write_midi_fallback(bpm=bpm, notes=notes, out_mid=out_mid, program=81)
+        return
+
+    pm = pretty_midi.PrettyMIDI(initial_tempo=float(bpm))
+    inst = pretty_midi.Instrument(program=81, name="Solo")
+
+    for ev in events:
+        start = beats_to_seconds(bpm, ev.start_beats)
+        end = beats_to_seconds(bpm, ev.start_beats + ev.dur_beats)
+        inst.notes.append(
+            pretty_midi.Note(
+                velocity=int(ev.velocity),
+                pitch=int(ev.pitch),
+                start=float(start),
+                end=float(end),
+            )
+        )
+
+    pm.instruments.append(inst)
+    pm.write(out_mid)
+
+
 
 # ----------------------------
 # CLI
@@ -3158,10 +3917,29 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument(
         "--section",
-        type=str,
+        nargs="+",
         default=None,
-        choices=SECTION_KINDS,
-        help="Force the entire song to use a single section kind (song structure + repeats remain).",
+        help=(
+            "Force the entire song to use a single section kind (song structure + repeats remain). "
+            "Optional mood for chord progressions: --section chordsprog happy"
+        ),
+    )
+    p.add_argument("--prog", action="store_true", help="Force all sections to use prog variants where possible.")
+    p.add_argument("--nonprog", action="store_true", help="Force all sections to use non-prog variants.")
+
+    p.add_argument(
+        "--chord_mood",
+        type=str,
+        choices=CHORDPROGRESSION_MOODS,
+        default="sad",
+        help="Mood filter for chordprogression/chordsprog selection (default: sad).",
+    )
+    p.add_argument(
+        "--mood",
+        type=str,
+        choices=CHORDPROGRESSION_MOODS,
+        default=None,
+        help="Alias for --chord_mood (default: sad).",
     )
 
     p.add_argument("--no_midi", action="store_true")
@@ -3190,11 +3968,27 @@ def main() -> None:
     base_tonic_midi = int(OPEN[6] + int(a.root_fret))
     vel = clampi(int(a.velocity), 1, 127)
 
-    forced_section = str(a.section) if a.section else None
+    forced_section = None
+    chord_mood = str(a.mood if a.mood is not None else a.chord_mood).strip().lower()
+    if a.prog and a.nonprog:
+        raise ValueError("Use only one of --prog or --nonprog.")
+    force_prog: Optional[bool] = True if a.prog else False if a.nonprog else None
+    if a.section:
+        section_parts = [str(x) for x in a.section]
+        forced_section = section_parts[0]
+        if forced_section not in SECTION_KINDS:
+            raise ValueError(f"Unknown section kind: {forced_section}")
+        if len(section_parts) > 2:
+            raise ValueError("Use --section <kind> [mood]")
+        if len(section_parts) == 2:
+            chord_mood = section_parts[1].strip().lower()
+            if chord_mood not in CHORDPROGRESSION_MOODS:
+                raise ValueError(f"Unknown chord mood: {chord_mood}")
+        forced_section = _apply_prog_mode(forced_section, force_prog)
     chordprog = None
     if a.chordprogression is not None:
         forced_section = "chordsprog"
-chordprog = None if str(a.chordprogression) == "random" else str(a.chordprogression)
+        chordprog = None if str(a.chordprogression) == "random" else str(a.chordprogression)
 
     events, bar_sections, beat_chords, label_to_ctx, bars_out = generate_song(
         total_bars=bars,
@@ -3204,11 +3998,14 @@ chordprog = None if str(a.chordprogression) == "random" else str(a.chordprogress
         ctx=ctx,
         tonechange=int(a.tonechange),
         chordprogression=chordprog,
+        chord_mood=chord_mood,
+        force_prog=force_prog,
         section=forced_section,
     )
 
     out_mid = f"{a.out}.mid"
     out_voc_mid = f"{a.out}_vocals.mid"
+    out_solo_mid = f"{a.out}_solo.mid"
     out_txt = f"{a.out}.txt"
 
     title = f"{a.out} | mode={ctx.mode} tone={pc_to_note(ctx.tonic_pc, True)} bars={bars_out} seed={seed}"
@@ -3225,6 +4022,20 @@ chordprog = None if str(a.chordprogression) == "random" else str(a.chordprogress
             velocity=VOCAL_DEFAULT_VELOCITY,
         )
         write_vocals_midi(bpm=bpm, events=vocal_events, out_mid=out_voc_mid)
+        solo_events = generate_solo_for_song(
+            bar_sections=bar_sections,
+            beat_chords=beat_chords,
+            label_to_ctx=label_to_ctx,
+            seed=seed,
+            velocity=VOCAL_DEFAULT_VELOCITY,
+        )
+        if solo_events:
+            write_solo_midi(bpm=bpm, events=solo_events, out_mid=out_solo_mid)
+            solo_written = True
+        else:
+            solo_written = False
+    else:
+        solo_written = False
 
     with open(out_txt, "w", encoding="utf-8") as f:
         f.write(title + "\n")
@@ -3234,6 +4045,9 @@ chordprog = None if str(a.chordprogression) == "random" else str(a.chordprogress
         f.write("\n")
         if LAST_LABEL_KINDS:
             f.write("LABEL→KIND: " + ", ".join(f"{k}={v}" for k, v in sorted(LAST_LABEL_KINDS.items())) + "\n\n")
+        if LAST_SOLO_LABEL:
+            base = LAST_SOLO_BASE_KIND or ""
+            f.write(f"SOLO→SECTION: {LAST_SOLO_LABEL} {base}+solomelody\n\n")
         f.write(events_to_tab(events, bars_out, bar_sections))
         f.write("\n")
 
@@ -3243,10 +4057,15 @@ chordprog = None if str(a.chordprogression) == "random" else str(a.chordprogress
         print(tone_details)
     if LAST_LABEL_KINDS:
         print("LABEL→KIND: " + ", ".join(f"{k}={v}" for k, v in sorted(LAST_LABEL_KINDS.items())))
+    if LAST_SOLO_LABEL:
+        base = LAST_SOLO_BASE_KIND or ""
+        print(f"SOLO→SECTION: {LAST_SOLO_LABEL} {base}+solomelody")
     print(f"Wrote: {out_txt}")
     if not a.no_midi:
         print(f"Wrote: {out_mid}")
         print(f"Wrote: {out_voc_mid}")
+        if solo_written:
+            print(f"Wrote: {out_solo_mid}")
 
 
 if __name__ == "__main__":
